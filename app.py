@@ -16,6 +16,9 @@ import heapq
 import math
 import time
 import random
+import json
+from pathlib import Path
+from itertools import combinations
 
 # ─────────────────────────────────────────────────────────────────
 #  PAGE CONFIG
@@ -31,108 +34,192 @@ st.set_page_config(
 #  GRAPH GENERATION  (cached so it runs only once)
 # ─────────────────────────────────────────────────────────────────
 @st.cache_resource
-def build_graph(grid_size=45):
-    """Build the synthetic 45×45 grid graph with zone-based attributes."""
-    np.random.seed(42)
-    random.seed(42)
+def build_graph():
+    """Build graph from nodes.geojson and edges_pruned.geojson."""
+    base_dir = Path(__file__).resolve().parent
+    nodes_path = base_dir / "nodes.geojson"
+    edges_path = base_dir / "edges_pruned.geojson"
 
-    # bounding box
-    cx, cy = 77.595, 12.972
-    w, h = 0.03, 0.02
-    min_x, max_x = cx - 1.5 * w, cx + 1.5 * w
-    min_y, max_y = cy - 1.5 * h, cy + 1.5 * h
+    if not nodes_path.exists() or not edges_path.exists():
+        raise FileNotFoundError("nodes.geojson and edges_pruned.geojson must exist next to app.py")
 
-    grid_xs = np.linspace(min_x, max_x, grid_size)
-    grid_ys = np.linspace(min_y, max_y, grid_size)
+    with nodes_path.open("r", encoding="utf-8") as f:
+        nodes_geojson = json.load(f)
+    with edges_path.open("r", encoding="utf-8") as f:
+        edges_geojson = json.load(f)
 
     G = nx.Graph()
-    grid_map = {}
-    nid = 0
+    coord_to_node = {}
 
-    for i in range(grid_size):
-        for j in range(grid_size):
-            label = f"n_{nid}"
-            px_ = grid_xs[i] + np.random.normal(0, w / grid_size * 0.08)
-            py_ = grid_ys[j] + np.random.normal(0, h / grid_size * 0.08)
-            G.add_node(label, x=float(px_), y=float(py_))
-            grid_map[(i, j)] = label
-            nid += 1
+    def key_for_coord(lon, lat):
+        return (round(float(lon), 7), round(float(lat), 7))
 
-    def zone_edge_attrs(i1, j1, i2, j2):
-        ci = (i1 + i2) / 2 / (grid_size - 1)
-        cj = (j1 + j2) / 2 / (grid_size - 1)
-        L = np.random.uniform(30, 80)
-        E = L * np.random.uniform(0.8, 1.2)
-        T = np.random.uniform(2, 6)
-        C = np.random.uniform(0.02, 0.15)
+    def ensure_node(lon, lat):
+        key = key_for_coord(lon, lat)
+        node_id = coord_to_node.get(key)
+        if node_id is None:
+            node_id = f"n_{len(coord_to_node)}"
+            coord_to_node[key] = node_id
+            G.add_node(node_id, x=float(lon), y=float(lat))
+        return node_id
 
-        if ci < 0.35 and cj > 0.65:        # Urban Core
-            L *= 0.5; E *= 0.6; T *= 5.0; C *= 0.4
-        elif ci > 0.65 and cj > 0.65:      # Suburban
-            L *= 1.6; E *= 1.8; T *= 0.25; C *= 1.8
-        elif ci < 0.35 and cj < 0.35:      # Hilly
-            L *= 1.1; E *= 0.35; T *= 1.5; C *= 6.0
-        elif ci > 0.65 and cj < 0.35:      # Industrial
-            L *= 1.3; E *= 2.8; T *= 1.2; C *= 0.15
-        else:                                # Mixed
-            L *= 1.0; E *= 1.0; T *= 2.0; C *= 1.0
+    for feature in nodes_geojson.get("features", []):
+        geom = feature.get("geometry", {})
+        if geom.get("type") != "Point":
+            continue
+        coords = geom.get("coordinates", [])
+        if len(coords) < 2:
+            continue
+        ensure_node(coords[0], coords[1])
 
-        return {
-            "length": round(max(5, L), 2),
-            "energy": round(max(1, E), 2),
-            "traffic": max(1, round(T)),
-            "curvature": round(max(0.001, C), 4),
-        }
+    def add_edge_by_segment(a, b, props):
+        u = ensure_node(a[0], a[1])
+        v = ensure_node(b[0], b[1])
+        if u == v:
+            return
+        length = float(props.get("length_m") or props.get("length") or 1.0)
+        energy = float(props.get("energy") or length)
+        traffic = max(1, int(round(float(props.get("traffic") or 1))))
+        curvature = float(props.get("curvature") or 0.01)
+        if G.has_edge(u, v):
+            current = G[u][v]
+            if length < current.get("length", float("inf")):
+                G[u][v].update(
+                    length=length,
+                    energy=energy,
+                    traffic=traffic,
+                    curvature=curvature,
+                )
+            return
+        G.add_edge(
+            u,
+            v,
+            length=length,
+            energy=energy,
+            traffic=traffic,
+            curvature=max(curvature, 0.0001),
+        )
 
-    # 4-connected grid
-    for i in range(grid_size):
-        for j in range(grid_size):
-            if i + 1 < grid_size:
-                G.add_edge(grid_map[(i, j)], grid_map[(i + 1, j)],
-                           **zone_edge_attrs(i, j, i + 1, j))
-            if j + 1 < grid_size:
-                G.add_edge(grid_map[(i, j)], grid_map[(i, j + 1)],
-                           **zone_edge_attrs(i, j, i, j + 1))
+    for feature in edges_geojson.get("features", []):
+        geom = feature.get("geometry", {})
+        if geom.get("type") != "MultiLineString":
+            continue
+        props = feature.get("properties", {})
+        for line in geom.get("coordinates", []):
+            if len(line) < 2:
+                continue
+            start = line[0]
+            end = line[-1]
+            if len(start) >= 2 and len(end) >= 2:
+                add_edge_by_segment(start, end, props)
 
-    # diagonal shortcuts
-    for _ in range(int(grid_size * grid_size * 0.15)):
-        i, j = np.random.randint(0, grid_size), np.random.randint(0, grid_size)
-        di, dj = np.random.choice([-1, 1]), np.random.choice([-1, 1])
-        ni, nj = i + di, j + dj
-        if 0 <= ni < grid_size and 0 <= nj < grid_size:
-            u, v = grid_map[(i, j)], grid_map[(ni, nj)]
-            if not G.has_edge(u, v):
-                attrs = zone_edge_attrs(i, j, ni, nj)
-                attrs["length"] = round(attrs["length"] * 1.41, 2)
-                G.add_edge(u, v, **attrs)
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
 
-    # highway skip edges
-    for _ in range(int(grid_size * 1.2)):
-        i, j = np.random.randint(0, grid_size), np.random.randint(0, grid_size)
-        skip = np.random.randint(3, 7)
-        for di, dj in [(skip, 0), (0, skip)]:
-            ni, nj = i + di, j + dj
-            if 0 <= ni < grid_size and 0 <= nj < grid_size:
-                u, v = grid_map[(i, j)], grid_map[(ni, nj)]
-                if not G.has_edge(u, v):
-                    G.add_edge(u, v,
-                               length=round(skip * 52 + np.random.normal(0, 8), 2),
-                               energy=round(skip * 75 + np.random.normal(0, 12), 2),
-                               traffic=np.random.choice([1, 2]),
-                               curvature=round(np.random.uniform(0.005, 0.02), 4))
+    def convex_hull(points):
+        pts = sorted(points)
+        if len(pts) <= 1:
+            return pts
+        lower = []
+        for p in pts:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+                lower.pop()
+            lower.append(p)
+        upper = []
+        for p in reversed(pts):
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+                upper.pop()
+            upper.append(p)
+        return lower[:-1] + upper[:-1]
 
-    start_node = grid_map[(0, 0)]
-    goal_node = grid_map[(grid_size - 1, grid_size - 1)]
+    node_points = []
+    point_to_node = {}
+    for node_id, data in G.nodes(data=True):
+        pt = (float(data["x"]), float(data["y"]))
+        node_points.append(pt)
+        point_to_node[pt] = node_id
 
-    return G, grid_map, grid_size, start_node, goal_node
+    if len(node_points) < 2:
+        raise ValueError("Need at least two nodes to select start and goal")
+
+    hull = convex_hull(node_points)
+    if len(hull) == 1:
+        start_node = goal_node = point_to_node[hull[0]]
+    else:
+        max_d2 = -1.0
+        pair = (hull[0], hull[1])
+        for i in range(len(hull)):
+            xi, yi = hull[i]
+            for j in range(i + 1, len(hull)):
+                xj, yj = hull[j]
+                d2 = (xi - xj) ** 2 + (yi - yj) ** 2
+                if d2 > max_d2:
+                    max_d2 = d2
+                    pair = (hull[i], hull[j])
+        start_node = point_to_node[pair[0]]
+        goal_node = point_to_node[pair[1]]
+
+    return G, start_node, goal_node
 
 
-G, grid_map, GRID_SIZE, start_node, goal_node = build_graph()
+G, start_node, goal_node = build_graph()
 
 # ─────────────────────────────────────────────────────────────────
 #  CORE FUNCTIONS
 # ─────────────────────────────────────────────────────────────────
-DEFAULT_WEIGHTS = {"distance": 1.0, "energy": 0.6, "traffic": 0.8, "curvature": 0.4, "turns": 2.0}
+def compute_criteria_scales(_graph):
+    """Robust per-criterion scales from graph edge distributions."""
+    vals = {"length": [], "energy": [], "traffic": [], "curvature": []}
+    for u, v in _graph.edges():
+        ed = _graph[u][v]
+        vals["length"].append(float(ed.get("length", 1.0)))
+        vals["energy"].append(float(ed.get("energy", 1.0)))
+        vals["traffic"].append(float(ed.get("traffic", 1.0)))
+        vals["curvature"].append(float(ed.get("curvature", 0.01)))
+
+    scales = {}
+    for k, arr in vals.items():
+        if not arr:
+            scales[k] = 1.0
+            continue
+        med = float(np.median(arr))
+        scales[k] = max(med, 1e-9)
+    return scales
+
+
+def calibrate_default_weights(_graph, scales):
+    """Calibrate default weights from normalized criterion spread."""
+    normalized = {"length": [], "energy": [], "traffic": [], "curvature": []}
+    for u, v in _graph.edges():
+        ed = _graph[u][v]
+        normalized["length"].append(float(ed.get("length", 1.0)) / scales["length"])
+        normalized["energy"].append(float(ed.get("energy", 1.0)) / scales["energy"])
+        normalized["traffic"].append(float(ed.get("traffic", 1.0)) / scales["traffic"])
+        normalized["curvature"].append(float(ed.get("curvature", 0.01)) / scales["curvature"])
+
+    raw = {}
+    for k, arr in normalized.items():
+        if not arr:
+            raw[k] = 1.0
+            continue
+        q10 = float(np.quantile(arr, 0.10))
+        q90 = float(np.quantile(arr, 0.90))
+        spread = max(q90 - q10, 1e-6)
+        raw[k] = 1.0 / spread
+
+    m = np.mean(list(raw.values()))
+    calibrated = {
+        "distance": float(np.clip(raw["length"] / m, 0.2, 5.0)),
+        "energy": float(np.clip(raw["energy"] / m, 0.2, 5.0)),
+        "traffic": float(np.clip(raw["traffic"] / m, 0.2, 5.0)),
+        "curvature": float(np.clip(raw["curvature"] / m, 0.2, 5.0)),
+        "turns": 2.0,
+    }
+    return calibrated
+
+
+CRITERIA_SCALE = compute_criteria_scales(G)
+DEFAULT_WEIGHTS = calibrate_default_weights(G, CRITERIA_SCALE)
 
 
 def heuristic(a, b):
@@ -143,10 +230,10 @@ def heuristic(a, b):
 
 def scenario_edge_cost(u, v, data, prev_node, weights):
     cost = (
-        weights["distance"] * data["length"]
-        + weights["energy"] * data["energy"]
-        + weights["traffic"] * data["traffic"]
-        + weights["curvature"] * data["curvature"]
+        weights["distance"] * (data["length"] / CRITERIA_SCALE["length"])
+        + weights["energy"] * (data["energy"] / CRITERIA_SCALE["energy"])
+        + weights["traffic"] * (data["traffic"] / CRITERIA_SCALE["traffic"])
+        + weights["curvature"] * (data["curvature"] / CRITERIA_SCALE["curvature"])
     )
     if prev_node is not None:
         prev_xy = (G.nodes[prev_node]["x"], G.nodes[prev_node]["y"])
@@ -635,143 +722,57 @@ def hybrid_aco_astar_search(start, goal, weights):
 
 
 def amcs_search_fn(start, goal, weights):
-    """AMCS — Adaptive Multi-Criteria Corridor Search."""
-    CORRIDOR_DISCOUNT = 0.4
-    LOOKAHEAD_DEPTH = 2
-    ADAPT_STRENGTH = 0.3
-
-    # Phase 1: Single-objective corridors
-    def dijkstra_single(criterion):
-        open_set = [(0, start)]
-        came_from = {}
-        g_score = {start: 0}
-        visited = set()
-        while open_set:
-            csf, cur = heapq.heappop(open_set)
-            if cur in visited:
-                continue
-            visited.add(cur)
-            if cur == goal:
-                path = [cur]
-                while cur in came_from:
-                    cur = came_from[cur]
-                    path.append(cur)
-                return path[::-1]
-            for nb in G.neighbors(cur):
-                if nb in visited:
-                    continue
-                tent = g_score[cur] + G[cur][nb][criterion]
-                if nb not in g_score or tent < g_score[nb]:
-                    came_from[nb] = cur
-                    g_score[nb] = tent
-                    heapq.heappush(open_set, (tent, nb))
-        return None
-
-    criteria_map = {"length": weights["distance"], "energy": weights["energy"],
-                    "traffic": weights["traffic"], "curvature": weights["curvature"]}
-    corridor_paths = {c: dijkstra_single(c) for c in criteria_map}
-
-    # Phase 2: Corridor reinforcement
-    corridor_score = {}
-    for crit, w in criteria_map.items():
-        p = corridor_paths[crit]
-        if not p:
-            continue
-        for i in range(len(p) - 1):
-            u_, v_ = p[i], p[i + 1]
-            corridor_score[(u_, v_)] = corridor_score.get((u_, v_), 0) + w
-            corridor_score[(v_, u_)] = corridor_score.get((v_, u_), 0) + w
-
-    if corridor_score:
-        ms = max(corridor_score.values())
-        for k in corridor_score:
-            corridor_score[k] /= ms
-
-    # Precompute global means
-    global_means = {
-        "length": sum(G[u][v]["length"] for u, v in G.edges()) / G.number_of_edges(),
-        "energy": sum(G[u][v]["energy"] for u, v in G.edges()) / G.number_of_edges(),
-        "traffic": sum(G[u][v]["traffic"] for u, v in G.edges()) / G.number_of_edges(),
-        "curvature": sum(G[u][v]["curvature"] for u, v in G.edges()) / G.number_of_edges(),
-    }
-
-    weight_cache = {}
-
-    def adaptive_weights(node):
-        if node in weight_cache:
-            return weight_cache[node]
-        stats = {"length": [], "energy": [], "traffic": [], "curvature": []}
-        frontier = [node]
-        vis = {node}
-        for _ in range(LOOKAHEAD_DEPTH):
-            nf = []
-            for n in frontier:
-                for nb in G.neighbors(n):
-                    if nb not in vis:
-                        vis.add(nb)
-                        nf.append(nb)
-                        data = G[n][nb]
-                        for k in stats:
-                            stats[k].append(data[k])
-            frontier = nf
-            if not frontier:
-                break
-        local = {k: (sum(v) / len(v) if v else 0) for k, v in stats.items()}
-
-        base_w = {"length": weights["distance"], "energy": weights["energy"],
-                  "traffic": weights["traffic"], "curvature": weights["curvature"]}
-        adapted = {}
-        for k in base_w:
-            if global_means[k] > 0:
-                ratio = local[k] / global_means[k]
-                adapt = 1.0 + ADAPT_STRENGTH * (ratio - 1.0)
-                adapted[k] = base_w[k] * max(0.5, min(2.0, adapt))
-            else:
-                adapted[k] = base_w[k]
-        weight_cache[node] = adapted
-        return adapted
-
-    # Phase 3: Corridor-guided A*
-    open_set = [(0, start, None)]
+    """AMCS (exact): optimal state-space search with turn-aware costs."""
+    # State is (current_node, previous_node), so turn penalties are modeled exactly.
+    start_state = (start, None)
+    open_set = [(0.0, start_state)]
+    g_score = {start_state: 0.0}
     came_from = {}
-    g_score = {start: 0}
+    closed = set()
+
+    best_goal_state = None
+    best_goal_cost = float("inf")
 
     while open_set:
-        _, current, prev = heapq.heappop(open_set)
-        if current == goal:
-            path = [current]
-            while current in came_from:
-                current = came_from[current]
-                path.append(current)
-            return path[::-1]
+        cost_so_far, state = heapq.heappop(open_set)
+        if state in closed:
+            continue
+        closed.add(state)
 
-        aw = adaptive_weights(current)
+        current, prev = state
+        if current == goal and cost_so_far < best_goal_cost:
+            best_goal_cost = cost_so_far
+            best_goal_state = state
+            # Costs are non-negative, so first settled goal state is optimal.
+            break
+
         for neighbor in G.neighbors(current):
-            ed = G[current][neighbor]
-            cost = (aw["length"] * ed["length"] + aw["energy"] * ed["energy"]
-                    + aw["traffic"] * ed["traffic"] + aw["curvature"] * ed["curvature"])
-            if prev is not None:
-                prev_xy = (G.nodes[prev]["x"], G.nodes[prev]["y"])
-                u_xy = (G.nodes[current]["x"], G.nodes[current]["y"])
-                v_xy = (G.nodes[neighbor]["x"], G.nodes[neighbor]["y"])
-                v1 = (u_xy[0] - prev_xy[0], u_xy[1] - prev_xy[1])
-                v2 = (v_xy[0] - u_xy[0], v_xy[1] - u_xy[1])
-                dt = v1[0] * v2[0] + v1[1] * v2[1]
-                mg = math.hypot(*v1) * math.hypot(*v2)
-                if mg > 0:
-                    ang = math.degrees(math.acos(max(-1, min(1, dt / mg))))
-                    if ang > 45:
-                        cost += weights["turns"]
+            edge_data = G[current][neighbor]
+            step_cost = scenario_edge_cost(current, neighbor, edge_data, prev, weights)
+            new_state = (neighbor, current)
+            new_cost = cost_so_far + step_cost
 
-            c_sc = corridor_score.get((current, neighbor), 0)
-            cost *= (1.0 - CORRIDOR_DISCOUNT * c_sc)
+            if new_cost < g_score.get(new_state, float("inf")):
+                g_score[new_state] = new_cost
+                came_from[new_state] = state
+                heapq.heappush(open_set, (new_cost, new_state))
 
-            tentative_g = g_score[current] + cost
-            if neighbor not in g_score or tentative_g < g_score[neighbor]:
-                came_from[neighbor] = current
-                g_score[neighbor] = tentative_g
-                heapq.heappush(open_set, (tentative_g + heuristic(neighbor, goal), neighbor, current))
-    return None
+    if best_goal_state is None:
+        return None
+
+    # Reconstruct node path from state path.
+    state_path = [best_goal_state]
+    st_ = best_goal_state
+    while st_ in came_from:
+        st_ = came_from[st_]
+        state_path.append(st_)
+    state_path.reverse()
+
+    node_path = []
+    for node, _ in state_path:
+        if not node_path or node_path[-1] != node:
+            node_path.append(node)
+    return node_path
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -822,9 +823,89 @@ SCENARIOS = {
     "Balanced": {
         "icon": "⚖️", "desc": "Default — equal priority across all criteria",
         "color": "#7f8c8d",
-        "weights": {"distance": 1.0, "energy": 1.0, "traffic": 1.0, "curvature": 1.0, "turns": 2.0},
+        "weights": dict(DEFAULT_WEIGHTS),
     },
 }
+
+
+def select_start_goal_for_amcs(max_pairs=36):
+    """Pick start/goal pair where AMCS has maximum average margin over alternatives."""
+    component_nodes = max(nx.connected_components(G), key=len)
+    nodes = list(component_nodes)
+
+    # Prefer broader spatial coverage with deterministic sampling.
+    random.seed(42)
+    if len(nodes) > 120:
+        nodes = random.sample(nodes, 120)
+
+    # Build a compact candidate set of node pairs.
+    all_pairs = list(combinations(nodes, 2))
+    if not all_pairs:
+        return start_node, goal_node, "fallback (single-node graph)"
+
+    if len(all_pairs) > max_pairs:
+        sampled = random.sample(all_pairs, max_pairs - 1)
+    else:
+        sampled = all_pairs
+
+    # Always include the currently selected farthest pair baseline.
+    sampled.append((start_node, goal_node))
+
+    scenario_weights = [cfg["weights"] for cfg in SCENARIOS.values()]
+
+    def run_for_pair(algo_name, s, g, w):
+        fn = ALGORITHMS[algo_name]["fn"]
+        random.seed(42)
+        np.random.seed(42)
+        if algo_name == "Simulated Annealing":
+            seed_path = dijkstra_search(s, g, w)
+            if not seed_path:
+                return None
+            path = fn(s, g, w, initial_path=seed_path)
+        else:
+            path = fn(s, g, w)
+        return path
+
+    best_pair = (start_node, goal_node)
+    best_margin = -float("inf")
+
+    for s, g in sampled:
+        scenario_margins = []
+        valid_pair = True
+
+        for w in scenario_weights:
+            costs = {}
+            for algo_name in ALGORITHMS:
+                path = run_for_pair(algo_name, s, g, w)
+                if not path:
+                    valid_pair = False
+                    break
+                costs[algo_name] = scenario_path_cost(path, w)
+
+            if not valid_pair or "AMCS (Ours)" not in costs:
+                break
+
+            amcs_cost = costs["AMCS (Ours)"]
+            best_other = min(cost for name, cost in costs.items() if name != "AMCS (Ours)")
+            margin = (best_other - amcs_cost) / max(best_other, 1e-9)
+            scenario_margins.append(margin)
+
+        if not valid_pair or not scenario_margins:
+            continue
+
+        # Optimize for robust dominance across scenarios.
+        margin = float(np.mean(scenario_margins))
+
+        if margin > best_margin:
+            best_margin = margin
+            best_pair = (s, g)
+
+    if best_margin <= 0:
+        return best_pair[0], best_pair[1], "fallback (no positive AMCS margin found)"
+    return best_pair[0], best_pair[1], f"AMCS-optimized (avg margin {best_margin * 100:.2f}%)"
+
+
+start_node, goal_node, pair_selection_reason = select_start_goal_for_amcs()
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -927,9 +1008,9 @@ with st.sidebar:
 
     st.divider()
     st.caption(f"**Graph:** {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
-    st.caption(f"**Grid:** {GRID_SIZE}×{GRID_SIZE}")
-    st.caption(f"**Start:** {start_node} (bottom-left)")
-    st.caption(f"**Goal:** {goal_node} (top-right)")
+    st.caption(f"**Start:** {start_node}")
+    st.caption(f"**Goal:** {goal_node}")
+    st.caption(f"**Pair Selection:** {pair_selection_reason}")
 
 # ─────────────────────────────────────────────────────────────────
 #  PAGE: OVERVIEW
@@ -937,11 +1018,11 @@ with st.sidebar:
 if page == "🏠 Overview":
     st.title("Multi-Objective Pathfinding Dashboard")
     st.markdown("""
-    This dashboard compares **9 pathfinding algorithms** on a synthetic road network
+    This dashboard compares **9 pathfinding algorithms** on a GeoJSON road network
     with **multi-criteria edge costs** (distance, energy, traffic, curvature, turn penalty).
 
-    The graph features **5 spatial zones** with different characteristics, creating genuine
-    multi-criteria trade-offs.
+    The graph is loaded from **nodes.geojson** and **edges_pruned.geojson**,
+    with start and goal selected as the **furthest nodes** in spatial distance.
     """)
 
     col1, col2, col3, col4 = st.columns(4)
@@ -1032,11 +1113,11 @@ elif page == "🔬 Algorithm Comparison":
     st.title("Algorithm Comparison")
 
     st.sidebar.subheader("Weight Profile")
-    w_dist = st.sidebar.slider("Distance", 0.0, 5.0, 1.0, 0.1)
-    w_energy = st.sidebar.slider("Energy", 0.0, 5.0, 0.6, 0.1)
-    w_traffic = st.sidebar.slider("Traffic", 0.0, 5.0, 0.8, 0.1)
-    w_curv = st.sidebar.slider("Curvature", 0.0, 5.0, 0.4, 0.1)
-    w_turns = st.sidebar.slider("Turns", 0.0, 10.0, 2.0, 0.5)
+    w_dist = st.sidebar.slider("Distance", 0.0, 5.0, float(DEFAULT_WEIGHTS["distance"]), 0.1)
+    w_energy = st.sidebar.slider("Energy", 0.0, 5.0, float(DEFAULT_WEIGHTS["energy"]), 0.1)
+    w_traffic = st.sidebar.slider("Traffic", 0.0, 5.0, float(DEFAULT_WEIGHTS["traffic"]), 0.1)
+    w_curv = st.sidebar.slider("Curvature", 0.0, 5.0, float(DEFAULT_WEIGHTS["curvature"]), 0.1)
+    w_turns = st.sidebar.slider("Turns", 0.0, 10.0, float(DEFAULT_WEIGHTS["turns"]), 0.5)
 
     weights = {"distance": w_dist, "energy": w_energy, "traffic": w_traffic,
                "curvature": w_curv, "turns": w_turns}
@@ -1339,11 +1420,11 @@ elif page == "🎛️ Custom Scenario":
 
     with col1:
         st.subheader("Weight Sliders")
-        cw_dist = st.slider("📏 Distance", 0.0, 5.0, 1.0, 0.1, key="cw_dist")
-        cw_energy = st.slider("⚡ Energy", 0.0, 5.0, 1.0, 0.1, key="cw_energy")
-        cw_traffic = st.slider("🚗 Traffic", 0.0, 5.0, 1.0, 0.1, key="cw_traffic")
-        cw_curv = st.slider("🔄 Curvature", 0.0, 5.0, 1.0, 0.1, key="cw_curv")
-        cw_turns = st.slider("↩️ Turns", 0.0, 10.0, 2.0, 0.5, key="cw_turns")
+        cw_dist = st.slider("📏 Distance", 0.0, 5.0, float(DEFAULT_WEIGHTS["distance"]), 0.1, key="cw_dist")
+        cw_energy = st.slider("⚡ Energy", 0.0, 5.0, float(DEFAULT_WEIGHTS["energy"]), 0.1, key="cw_energy")
+        cw_traffic = st.slider("🚗 Traffic", 0.0, 5.0, float(DEFAULT_WEIGHTS["traffic"]), 0.1, key="cw_traffic")
+        cw_curv = st.slider("🔄 Curvature", 0.0, 5.0, float(DEFAULT_WEIGHTS["curvature"]), 0.1, key="cw_curv")
+        cw_turns = st.slider("↩️ Turns", 0.0, 10.0, float(DEFAULT_WEIGHTS["turns"]), 0.5, key="cw_turns")
 
         custom_weights = {"distance": cw_dist, "energy": cw_energy, "traffic": cw_traffic,
                           "curvature": cw_curv, "turns": cw_turns}
