@@ -789,43 +789,151 @@ ALGORITHMS = {
     "AMCS (Ours)": {"fn": amcs_search_fn, "color": "#E91E63", "desc": "Adaptive Multi-Criteria Corridor Search"},
 }
 
-SCENARIOS = {
+SCENARIO_META = {
     "Fragile Cargo": {
-        "icon": "📦", "desc": "Glass/electronics — smooth ride, minimal turns",
-        "color": "#e74c3c",
-        "weights": {"distance": 0.3, "energy": 0.3, "traffic": 0.4, "curvature": 3.0, "turns": 8.0},
+        "icon": "📦", "desc": "Empirical smoothness profile (curvature + turn geometry)", "color": "#e74c3c"
     },
     "Urgent Delivery": {
-        "icon": "⚡", "desc": "Time-critical — shortest distance, ignore comfort",
-        "color": "#f39c12",
-        "weights": {"distance": 3.0, "energy": 0.2, "traffic": 0.3, "curvature": 0.1, "turns": 0.5},
+        "icon": "⚡", "desc": "Empirical shortest-route pressure (distance-driven)", "color": "#f39c12"
     },
     "Low Battery": {
-        "icon": "🔋", "desc": "Battery < 20% — minimize energy at all costs",
-        "color": "#2ecc71",
-        "weights": {"distance": 0.4, "energy": 3.5, "traffic": 0.2, "curvature": 0.3, "turns": 0.5},
+        "icon": "🔋", "desc": "Empirical high-energy-penalty profile", "color": "#2ecc71"
     },
     "Rush Hour": {
-        "icon": "🚗", "desc": "Peak traffic — avoid congested roads",
-        "color": "#3498db",
-        "weights": {"distance": 0.8, "energy": 0.4, "traffic": 4.0, "curvature": 0.3, "turns": 0.5},
+        "icon": "🚗", "desc": "Empirical high-traffic-penalty profile", "color": "#3498db"
     },
     "Heavy Load": {
-        "icon": "🏋️", "desc": "50 kg payload — minimize strain and sharp turns",
-        "color": "#9b59b6",
-        "weights": {"distance": 0.5, "energy": 2.5, "traffic": 0.5, "curvature": 2.0, "turns": 5.0},
+        "icon": "🏋️", "desc": "Empirical strain profile (energy + curvature + turns)", "color": "#9b59b6"
     },
     "Night / Stealth": {
-        "icon": "🌙", "desc": "Late night — quiet roads, low residential disturbance",
-        "color": "#34495e",
-        "weights": {"distance": 0.5, "energy": 0.5, "traffic": 3.5, "curvature": 1.5, "turns": 1.0},
+        "icon": "🌙", "desc": "Empirical low-disturbance proxy (traffic + smoothness)", "color": "#34495e"
     },
     "Balanced": {
-        "icon": "⚖️", "desc": "Default — equal priority across all criteria",
-        "color": "#7f8c8d",
-        "weights": dict(DEFAULT_WEIGHTS),
+        "icon": "⚖️", "desc": "Empirical baseline from graph-wide distributions", "color": "#7f8c8d"
     },
 }
+
+
+def _compute_turn_sharpness_stats(graph):
+    sharpness = []
+    for u in graph.nodes():
+        nbs = list(graph.neighbors(u))
+        if len(nbs) < 2:
+            continue
+        u_xy = (graph.nodes[u]["x"], graph.nodes[u]["y"])
+        for i in range(len(nbs)):
+            for j in range(i + 1, len(nbs)):
+                a, b = nbs[i], nbs[j]
+                a_xy = (graph.nodes[a]["x"], graph.nodes[a]["y"])
+                b_xy = (graph.nodes[b]["x"], graph.nodes[b]["y"])
+                v1 = (a_xy[0] - u_xy[0], a_xy[1] - u_xy[1])
+                v2 = (b_xy[0] - u_xy[0], b_xy[1] - u_xy[1])
+                mag = math.hypot(*v1) * math.hypot(*v2)
+                if mag <= 0:
+                    continue
+                dot = v1[0] * v2[0] + v1[1] * v2[1]
+                ang = math.degrees(math.acos(max(-1, min(1, dot / mag))))
+                sharpness.append(max(0.0, (ang - 45.0) / 135.0))
+    if not sharpness:
+        return {"q10": 0.0, "q50": 0.0, "q90": 0.0}
+    return {
+        "q10": float(np.quantile(sharpness, 0.10)),
+        "q50": float(np.quantile(sharpness, 0.50)),
+        "q90": float(np.quantile(sharpness, 0.90)),
+    }
+
+
+def build_empirical_scenarios(graph, base_weights):
+    # Normalized per-edge criteria from already computed scales.
+    norm = {"distance": [], "energy": [], "traffic": [], "curvature": []}
+    for u, v in graph.edges():
+        ed = graph[u][v]
+        norm["distance"].append(float(ed["length"]) / CRITERIA_SCALE["length"])
+        norm["energy"].append(float(ed["energy"]) / CRITERIA_SCALE["energy"])
+        norm["traffic"].append(float(ed["traffic"]) / CRITERIA_SCALE["traffic"])
+        norm["curvature"].append(float(ed["curvature"]) / CRITERIA_SCALE["curvature"])
+
+    stats = {}
+    for k, arr in norm.items():
+        q10 = float(np.quantile(arr, 0.10))
+        q50 = float(np.quantile(arr, 0.50))
+        q90 = float(np.quantile(arr, 0.90))
+        stats[k] = {
+            "high": q90 / max(q50, 1e-9),
+            "low": q10 / max(q50, 1e-9),
+        }
+
+    turn_stats = _compute_turn_sharpness_stats(graph)
+    turn_high = 1.0 + 4.0 * max(0.0, turn_stats["q90"] - turn_stats["q50"])
+    turn_low = max(0.25, 1.0 - 2.0 * max(0.0, turn_stats["q50"] - turn_stats["q10"]))
+
+    def mk(mult):
+        out = {}
+        out["distance"] = float(np.clip(base_weights["distance"] * mult["distance"], 0.0, 5.0))
+        out["energy"] = float(np.clip(base_weights["energy"] * mult["energy"], 0.0, 5.0))
+        out["traffic"] = float(np.clip(base_weights["traffic"] * mult["traffic"], 0.0, 5.0))
+        out["curvature"] = float(np.clip(base_weights["curvature"] * mult["curvature"], 0.0, 5.0))
+        out["turns"] = float(np.clip(base_weights["turns"] * mult["turns"], 0.0, 10.0))
+        return out
+
+    empirical_weights = {
+        "Fragile Cargo": mk({
+            "distance": stats["distance"]["low"],
+            "energy": stats["energy"]["low"],
+            "traffic": stats["traffic"]["low"],
+            "curvature": stats["curvature"]["high"],
+            "turns": turn_high,
+        }),
+        "Urgent Delivery": mk({
+            "distance": stats["distance"]["high"],
+            "energy": stats["energy"]["low"],
+            "traffic": stats["traffic"]["low"],
+            "curvature": stats["curvature"]["low"],
+            "turns": turn_low,
+        }),
+        "Low Battery": mk({
+            "distance": stats["distance"]["low"],
+            "energy": stats["energy"]["high"],
+            "traffic": stats["traffic"]["low"],
+            "curvature": stats["curvature"]["low"],
+            "turns": turn_low,
+        }),
+        "Rush Hour": mk({
+            "distance": stats["distance"]["low"],
+            "energy": stats["energy"]["low"],
+            "traffic": stats["traffic"]["high"],
+            "curvature": stats["curvature"]["low"],
+            "turns": turn_low,
+        }),
+        "Heavy Load": mk({
+            "distance": stats["distance"]["low"],
+            "energy": stats["energy"]["high"],
+            "traffic": stats["traffic"]["low"],
+            "curvature": stats["curvature"]["high"],
+            "turns": turn_high,
+        }),
+        "Night / Stealth": mk({
+            "distance": stats["distance"]["low"],
+            "energy": stats["energy"]["low"],
+            "traffic": stats["traffic"]["high"],
+            "curvature": max(1.0, stats["curvature"]["high"] * 0.8),
+            "turns": (turn_high + turn_low) / 2.0,
+        }),
+        "Balanced": dict(base_weights),
+    }
+
+    scenarios = {}
+    for name, meta in SCENARIO_META.items():
+        scenarios[name] = {
+            "icon": meta["icon"],
+            "desc": meta["desc"],
+            "color": meta["color"],
+            "weights": empirical_weights[name],
+        }
+    return scenarios
+
+
+SCENARIOS = build_empirical_scenarios(G, DEFAULT_WEIGHTS)
 
 
 def select_start_goal_for_amcs(max_pairs=36):
@@ -908,6 +1016,129 @@ def select_start_goal_for_amcs(max_pairs=36):
 start_node, goal_node, pair_selection_reason = select_start_goal_for_amcs()
 
 
+def _hex_to_rgba(hex_color, alpha=0.08):
+    hc = hex_color.lstrip("#")
+    r = int(hc[0:2], 16)
+    g = int(hc[2:4], 16)
+    b = int(hc[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def compute_data_driven_zones(graph, k=4):
+    """Cluster nodes into zones using coordinates + local edge characteristics."""
+    nodes = list(graph.nodes())
+    n = len(nodes)
+    if n == 0:
+        return {}, []
+
+    xs = np.array([float(graph.nodes[nid]["x"]) for nid in nodes], dtype=float)
+    ys = np.array([float(graph.nodes[nid]["y"]) for nid in nodes], dtype=float)
+
+    mean_len = np.zeros(n, dtype=float)
+    mean_en = np.zeros(n, dtype=float)
+    mean_tr = np.zeros(n, dtype=float)
+    mean_curv = np.zeros(n, dtype=float)
+
+    global_len = np.mean([graph[u][v]["length"] for u, v in graph.edges()])
+    global_en = np.mean([graph[u][v]["energy"] for u, v in graph.edges()])
+    global_tr = np.mean([graph[u][v]["traffic"] for u, v in graph.edges()])
+    global_curv = np.mean([graph[u][v]["curvature"] for u, v in graph.edges()])
+
+    for i, nid in enumerate(nodes):
+        nbs = list(graph.neighbors(nid))
+        if not nbs:
+            mean_len[i] = global_len
+            mean_en[i] = global_en
+            mean_tr[i] = global_tr
+            mean_curv[i] = global_curv
+            continue
+        eds = [graph[nid][nb] for nb in nbs]
+        mean_len[i] = float(np.mean([ed["length"] for ed in eds]))
+        mean_en[i] = float(np.mean([ed["energy"] for ed in eds]))
+        mean_tr[i] = float(np.mean([ed["traffic"] for ed in eds]))
+        mean_curv[i] = float(np.mean([ed["curvature"] for ed in eds]))
+
+    def robust_norm(arr):
+        med = float(np.median(arr))
+        q1 = float(np.quantile(arr, 0.25))
+        q3 = float(np.quantile(arr, 0.75))
+        iqr = max(q3 - q1, 1e-9)
+        return (arr - med) / iqr
+
+    feats = np.column_stack([
+        robust_norm(xs),
+        robust_norm(ys),
+        robust_norm(mean_len),
+        robust_norm(mean_en),
+        robust_norm(mean_tr),
+        robust_norm(mean_curv),
+    ])
+
+    k = max(1, min(int(k), n))
+    rng = np.random.default_rng(42)
+    init_idx = rng.choice(n, size=k, replace=False)
+    centers = feats[init_idx].copy()
+    labels = np.zeros(n, dtype=int)
+
+    for _ in range(50):
+        dists = np.linalg.norm(feats[:, None, :] - centers[None, :, :], axis=2)
+        new_labels = np.argmin(dists, axis=1)
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+        for ci in range(k):
+            pts = feats[labels == ci]
+            if len(pts) > 0:
+                centers[ci] = np.mean(pts, axis=0)
+
+    palette = ["#e74c3c", "#2ecc71", "#3498db", "#9b59b6", "#f39c12", "#16a085"]
+    unique_clusters = sorted(np.unique(labels).tolist())
+    zones = []
+    cluster_to_name = {}
+
+    for zi, cid in enumerate(unique_clusters):
+        idx = np.where(labels == cid)[0]
+        if len(idx) == 0:
+            continue
+        z_nodes = [nodes[i] for i in idx]
+        z_x = xs[idx]
+        z_y = ys[idx]
+        z_len = mean_len[idx]
+        z_en = mean_en[idx]
+        z_tr = mean_tr[idx]
+        z_curv = mean_curv[idx]
+
+        name = f"Zone {zi + 1}"
+        color = palette[zi % len(palette)]
+        cluster_to_name[cid] = name
+        zones.append({
+            "name": name,
+            "color": color,
+            "fill": _hex_to_rgba(color, 0.08),
+            "x0": float(np.min(z_x)),
+            "x1": float(np.max(z_x)),
+            "y0": float(np.min(z_y)),
+            "y1": float(np.max(z_y)),
+            "nodes": z_nodes,
+            "stats": {
+                "distance": float(np.median(z_len)),
+                "energy": float(np.median(z_en)),
+                "traffic": float(np.median(z_tr)),
+                "curvature": float(np.median(z_curv)),
+            },
+        })
+
+    node_to_zone = {}
+    for i, nid in enumerate(nodes):
+        node_to_zone[nid] = cluster_to_name[int(labels[i])]
+
+    return node_to_zone, zones
+
+
+NODE_ZONE, ZONES = compute_data_driven_zones(G, k=4)
+ZONE_LOOKUP = {z["name"]: z for z in ZONES}
+
+
 # ─────────────────────────────────────────────────────────────────
 #  RUN ALGORITHMS (cached)
 # ─────────────────────────────────────────────────────────────────
@@ -975,24 +1206,17 @@ def get_path_coords(path):
 
 def create_zone_background():
     """Create zone overlay annotations."""
-    all_x = [G.nodes[n]["x"] for n in G.nodes()]
-    all_y = [G.nodes[n]["y"] for n in G.nodes()]
-    mx, Mx = min(all_x), max(all_x)
-    my, My = min(all_y), max(all_y)
-    cx = (mx + Mx) / 2
-    cy = (my + My) / 2
-
-    zones = [
-        {"name": "Urban Core", "x0": mx, "x1": cx, "y0": cy, "y1": My,
-         "color": "rgba(231,76,60,0.08)"},
-        {"name": "Suburban", "x0": cx, "x1": Mx, "y0": cy, "y1": My,
-         "color": "rgba(46,204,113,0.08)"},
-        {"name": "Hilly", "x0": mx, "x1": cx, "y0": my, "y1": cy,
-         "color": "rgba(52,152,219,0.08)"},
-        {"name": "Industrial", "x0": cx, "x1": Mx, "y0": my, "y1": cy,
-         "color": "rgba(155,89,182,0.08)"},
+    return [
+        {
+            "name": z["name"],
+            "x0": z["x0"],
+            "x1": z["x1"],
+            "y0": z["y0"],
+            "y1": z["y1"],
+            "color": z["fill"],
+        }
+        for z in ZONES
     ]
-    return zones
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1022,7 +1246,7 @@ if page == "🏠 Overview":
     with **multi-criteria edge costs** (distance, energy, traffic, curvature, turn penalty).
 
     The graph is loaded from **nodes.geojson** and **edges_pruned.geojson**,
-    with start and goal selected as the **furthest nodes** in spatial distance.
+    with **data-driven zones** learned from node location and local edge characteristics.
     """)
 
     col1, col2, col3, col4 = st.columns(4)
@@ -1033,41 +1257,29 @@ if page == "🏠 Overview":
 
     st.subheader("Zone Map")
 
-    # Build a scatter for all nodes colored by zone
+    # Build a scatter for all nodes colored by learned zone
     node_colors = []
     node_x = []
     node_y = []
     zone_labels = []
-    all_x = [G.nodes[n]["x"] for n in G.nodes()]
-    all_y = [G.nodes[n]["y"] for n in G.nodes()]
-    mx, Mx = min(all_x), max(all_x)
-    my, My = min(all_y), max(all_y)
-    cx_m = (mx + Mx) / 2
-    cy_m = (my + My) / 2
 
     for n in G.nodes():
         x_, y_ = G.nodes[n]["x"], G.nodes[n]["y"]
         node_x.append(x_)
         node_y.append(y_)
-        if x_ < cx_m and y_ > cy_m:
-            zone_labels.append("Urban Core")
-            node_colors.append("#e74c3c")
-        elif x_ > cx_m and y_ > cy_m:
-            zone_labels.append("Suburban")
-            node_colors.append("#2ecc71")
-        elif x_ < cx_m and y_ <= cy_m:
-            zone_labels.append("Hilly")
-            node_colors.append("#3498db")
-        elif x_ > cx_m and y_ <= cy_m:
-            zone_labels.append("Industrial")
-            node_colors.append("#9b59b6")
-        else:
-            zone_labels.append("Mixed")
+        zname = NODE_ZONE.get(n)
+        zcfg = ZONE_LOOKUP.get(zname)
+        if zcfg is None:
+            zone_labels.append("Unassigned")
             node_colors.append("#7f8c8d")
+        else:
+            zone_labels.append(zname)
+            node_colors.append(zcfg["color"])
 
     fig = go.Figure()
-    for zname, zcolor in [("Urban Core", "#e74c3c"), ("Suburban", "#2ecc71"),
-                           ("Hilly", "#3498db"), ("Industrial", "#9b59b6")]:
+    for z in ZONES:
+        zname = z["name"]
+        zcolor = z["color"]
         idx = [i for i, z in enumerate(zone_labels) if z == zname]
         fig.add_trace(go.Scatter(
             x=[node_x[i] for i in idx], y=[node_y[i] for i in idx],
@@ -1095,14 +1307,19 @@ if page == "🏠 Overview":
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Zone Characteristics")
-    zone_df = pd.DataFrame({
-        "Zone": ["Urban Core (TL)", "Suburban (TR)", "Hilly (BL)", "Industrial (BR)", "Mixed (Center)"],
-        "Distance": ["Short ⬇️", "Long ⬆️", "Medium", "Medium-Long", "Medium"],
-        "Energy": ["Low ⬇️", "High ⬆️", "Very Low ⬇️⬇️", "Very High ⬆️⬆️", "Medium"],
-        "Traffic": ["Very High ⬆️⬆️", "Very Low ⬇️⬇️", "Medium", "Medium", "High ⬆️"],
-        "Curvature": ["Low ⬇️", "High ⬆️", "Very High ⬆️⬆️", "Very Low ⬇️⬇️", "Medium"],
-    })
+    st.subheader("Zone Characteristics (Data-Driven)")
+    zone_rows = []
+    for z in ZONES:
+        stt = z["stats"]
+        zone_rows.append({
+            "Zone": z["name"],
+            "Nodes": len(z["nodes"]),
+            "Median Distance": round(stt["distance"], 2),
+            "Median Energy": round(stt["energy"], 2),
+            "Median Traffic": round(stt["traffic"], 2),
+            "Median Curvature": round(stt["curvature"], 4),
+        })
+    zone_df = pd.DataFrame(zone_rows)
     st.dataframe(zone_df, use_container_width=True, hide_index=True)
 
 
