@@ -21,3 +21,20 @@ Thumbs.db
 
 # QGIS project (large binary)
 *.qgz
+
+# Generator scripts
+create_presentation.py
+create_backlog.py
+create_retrospective.py
+create_test_cases.py
+
+# Generated files
+*.pptx
+*.docx
+AMCS_Product_Backlog.xlsx
+AMCS_Product_Backlog_Updated.xlsx
+AMCS_Sprint_Retrospectives.xlsx
+AMCS_Functional_Test_Cases.xlsx
+AMCS_Functional_Requirements_Document.md
+AMCS_Result_Analysis_Outcome.md
+AMCS_Architecture_Document.docx
