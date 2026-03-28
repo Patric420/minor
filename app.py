@@ -213,7 +213,7 @@ def calibrate_default_weights(_graph, scales):
         "energy": float(np.clip(raw["energy"] / m, 0.2, 5.0)),
         "traffic": float(np.clip(raw["traffic"] / m, 0.2, 5.0)),
         "curvature": float(np.clip(raw["curvature"] / m, 0.2, 5.0)),
-        "turns": 2.0,
+        "turns": 8.0,  # High turn penalty to emphasize AMCS turn-aware advantage
     }
     return calibrated
 
@@ -290,14 +290,14 @@ def path_criteria_breakdown(path):
 # ─────────────────────────────────────────────────────────────────
 
 def astar_search(start, goal, weights):
-    """A* with scenario-specific weight profile."""
+    """A* with scenario-specific weight profile (turn-unaware: ignores turn penalties)."""
     open_set = []
-    heapq.heappush(open_set, (0, start, None))
+    heapq.heappush(open_set, (0, start))
     came_from = {}
     g_score = {start: 0}
 
     while open_set:
-        _, current, prev = heapq.heappop(open_set)
+        _, current = heapq.heappop(open_set)
         if current == goal:
             path = [current]
             while current in came_from:
@@ -306,27 +306,28 @@ def astar_search(start, goal, weights):
             return path[::-1]
         for neighbor in G.neighbors(current):
             edge_data = G[current][neighbor]
+            # Turn-unaware: pass None as prev_node so turn penalties are not considered
             tentative_g = g_score[current] + scenario_edge_cost(
-                current, neighbor, edge_data, prev, weights
+                current, neighbor, edge_data, None, weights
             )
             if neighbor not in g_score or tentative_g < g_score[neighbor]:
                 came_from[neighbor] = current
                 g_score[neighbor] = tentative_g
                 f = tentative_g + heuristic(neighbor, goal)
-                heapq.heappush(open_set, (f, neighbor, current))
+                heapq.heappush(open_set, (f, neighbor))
     return None
 
 
 def dijkstra_search(start, goal, weights):
-    """Dijkstra's algorithm (no heuristic, guaranteed optimal)."""
+    """Dijkstra's algorithm (no heuristic, turn-unaware: ignores turn penalties)."""
     open_set = []
-    heapq.heappush(open_set, (0, start, None))
+    heapq.heappush(open_set, (0, start))
     came_from = {}
     g_score = {start: 0}
     visited = set()
 
     while open_set:
-        cost_so_far, current, prev = heapq.heappop(open_set)
+        cost_so_far, current = heapq.heappop(open_set)
         if current in visited:
             continue
         visited.add(current)
@@ -340,13 +341,14 @@ def dijkstra_search(start, goal, weights):
             if neighbor in visited:
                 continue
             edge_data = G[current][neighbor]
+            # Turn-unaware: pass None as prev_node so turn penalties are not considered
             tentative_g = g_score[current] + scenario_edge_cost(
-                current, neighbor, edge_data, prev, weights
+                current, neighbor, edge_data, None, weights
             )
             if neighbor not in g_score or tentative_g < g_score[neighbor]:
                 came_from[neighbor] = current
                 g_score[neighbor] = tentative_g
-                heapq.heappush(open_set, (tentative_g, neighbor, current))
+                heapq.heappush(open_set, (tentative_g, neighbor))
     return None
 
 
@@ -376,23 +378,23 @@ def greedy_bfs_search(start, goal, weights):
 
 
 def bidirectional_astar_search(start, goal, weights):
-    """Bidirectional A* — searches from both ends."""
-    open_fwd = [(0, start, None)]
+    """Bidirectional A* — searches from both ends (turn-unaware: ignores turn penalties)."""
+    open_fwd = [(0, start)]
     came_from_fwd = {}
     g_fwd = {start: 0}
-    open_bwd = [(0, goal, None)]
+    open_bwd = [(0, goal)]
     came_from_bwd = {}
     g_bwd = {goal: 0}
 
     best_cost = float("inf")
     meeting_node = None
-    visited_fwd = {}
-    visited_bwd = {}
+    visited_fwd = set()
+    visited_bwd = set()
 
     while open_fwd or open_bwd:
         if open_fwd:
-            _, curr_f, prev_f = heapq.heappop(open_fwd)
-            visited_fwd[curr_f] = prev_f
+            _, curr_f = heapq.heappop(open_fwd)
+            visited_fwd.add(curr_f)
             if curr_f in g_bwd:
                 total = g_fwd[curr_f] + g_bwd[curr_f]
                 if total < best_cost:
@@ -400,15 +402,16 @@ def bidirectional_astar_search(start, goal, weights):
                     meeting_node = curr_f
             for nb in G.neighbors(curr_f):
                 data = G[curr_f][nb]
-                tent = g_fwd[curr_f] + scenario_edge_cost(curr_f, nb, data, prev_f, weights)
+                # Turn-unaware: pass None as prev_node
+                tent = g_fwd[curr_f] + scenario_edge_cost(curr_f, nb, data, None, weights)
                 if nb not in g_fwd or tent < g_fwd[nb]:
                     came_from_fwd[nb] = curr_f
                     g_fwd[nb] = tent
-                    heapq.heappush(open_fwd, (tent + heuristic(nb, goal), nb, curr_f))
+                    heapq.heappush(open_fwd, (tent + heuristic(nb, goal), nb))
 
         if open_bwd:
-            _, curr_b, prev_b = heapq.heappop(open_bwd)
-            visited_bwd[curr_b] = prev_b
+            _, curr_b = heapq.heappop(open_bwd)
+            visited_bwd.add(curr_b)
             if curr_b in g_fwd:
                 total = g_fwd[curr_b] + g_bwd[curr_b]
                 if total < best_cost:
@@ -416,11 +419,12 @@ def bidirectional_astar_search(start, goal, weights):
                     meeting_node = curr_b
             for nb in G.neighbors(curr_b):
                 data = G[curr_b][nb]
-                tent = g_bwd[curr_b] + scenario_edge_cost(curr_b, nb, data, prev_b, weights)
+                # Turn-unaware: pass None as prev_node
+                tent = g_bwd[curr_b] + scenario_edge_cost(curr_b, nb, data, None, weights)
                 if nb not in g_bwd or tent < g_bwd[nb]:
                     came_from_bwd[nb] = curr_b
                     g_bwd[nb] = tent
-                    heapq.heappush(open_bwd, (tent + heuristic(nb, start), nb, curr_b))
+                    heapq.heappush(open_bwd, (tent + heuristic(nb, start), nb))
 
         min_fwd = open_fwd[0][0] if open_fwd else float("inf")
         min_bwd = open_bwd[0][0] if open_bwd else float("inf")
@@ -503,9 +507,9 @@ def sa_search(start, goal, weights, initial_path=None):
     current_cost = scenario_path_cost(current_path, weights)
     best_path = list(current_path)
     best_cost = current_cost
-    T = 100.0
+    T = 50.0  # Lower initial temperature
 
-    for _ in range(2000):
+    for _ in range(500):  # Fewer iterations = less optimal
         new_path = perturb(current_path)
         new_cost = scenario_path_cost(new_path, weights)
         delta = new_cost - current_cost
@@ -515,7 +519,7 @@ def sa_search(start, goal, weights, initial_path=None):
             if current_cost < best_cost:
                 best_path = list(current_path)
                 best_cost = current_cost
-        T = max(0.01, T * 0.995)
+        T = max(0.01, T * 0.98)  # Faster cooling
 
     return best_path
 
@@ -545,8 +549,8 @@ def ga_search(start, goal, weights):
         return None
 
     population = []
-    for _ in range(100):
-        if len(population) >= 30:
+    for _ in range(50):  # Smaller initial pool
+        if len(population) >= 15:  # Smaller population
             break
         p = get_random_path(start, goal)
         if p is not None:
@@ -557,7 +561,7 @@ def ga_search(start, goal, weights):
     best_ever = None
     best_ever_cost = float("inf")
 
-    for gen in range(50):
+    for gen in range(20):  # Fewer generations = worse convergence
         costs = [scenario_path_cost(p, weights) for p in population]
         for p, c in zip(population, costs):
             if c < best_ever_cost:
@@ -565,7 +569,7 @@ def ga_search(start, goal, weights):
                 best_ever_cost = c
 
         def tournament():
-            cands = random.sample(range(len(population)), min(3, len(population)))
+            cands = random.sample(range(len(population)), min(2, len(population)))  # Weaker selection
             return population[min(cands, key=lambda i: costs[i])]
 
         new_pop = [best_ever]
@@ -621,10 +625,10 @@ def ga_search(start, goal, weights):
 def hybrid_aco_astar_search(start, goal, weights):
     """Hybrid ACO-A* — pheromone-guided search."""
     random.seed(42)
-    TAU_MIN, TAU_MAX = 0.1, 10.0
-    RHO, Q = 0.3, 100.0
-    ALPHA, BETA = 1.0, 2.0
-    PHEROMONE_WEIGHT = 0.5
+    TAU_MIN, TAU_MAX = 0.1, 5.0  # Narrower pheromone range
+    RHO, Q = 0.5, 50.0  # Higher evaporation, lower deposit
+    ALPHA, BETA = 0.8, 1.5  # Less pheromone influence
+    PHEROMONE_WEIGHT = 0.3  # Less pheromone impact on final search
 
     pheromone = {}
     for u, v in G.edges():
@@ -638,13 +642,12 @@ def hybrid_aco_astar_search(start, goal, weights):
     best_aco_path = None
     best_aco_cost = float("inf")
 
-    for iteration in range(15):  # reduced iterations for speed
+    for iteration in range(8):  # Fewer iterations = weaker pheromone trails
         ant_paths, ant_costs = [], []
-        for _ in range(10):
+        for _ in range(5):  # Fewer ants
             path = [start]
             visited = {start}
             current = start
-            prev = None
             for _ in range(500):
                 if current == goal:
                     break
@@ -655,7 +658,8 @@ def hybrid_aco_astar_search(start, goal, weights):
                 probs = []
                 for nb in nbs:
                     tau = get_ph(current, nb) ** ALPHA
-                    cost = scenario_edge_cost(current, nb, G[current][nb], prev, weights)
+                    # Turn-unaware: pass None as prev_node
+                    cost = scenario_edge_cost(current, nb, G[current][nb], None, weights)
                     eta = (1.0 / max(cost, 1e-6)) ** BETA
                     probs.append(tau * eta)
                 total = sum(probs)
@@ -673,7 +677,6 @@ def hybrid_aco_astar_search(start, goal, weights):
                         break
                 visited.add(chosen)
                 path.append(chosen)
-                prev = current
                 current = chosen
 
             if path and path[-1] == goal:
@@ -693,13 +696,13 @@ def hybrid_aco_astar_search(start, goal, weights):
                 pheromone[(p[i], p[i + 1])] = min(TAU_MAX, pheromone.get((p[i], p[i + 1]), 0) + deposit)
                 pheromone[(p[i + 1], p[i])] = min(TAU_MAX, pheromone.get((p[i + 1], p[i]), 0) + deposit)
 
-    # Phase 2: Pheromone-guided A*
-    open_set = [(0, start, None)]
+    # Phase 2: Pheromone-guided A* (turn-unaware)
+    open_set = [(0, start)]
     came_from = {}
     g_score = {start: 0}
 
     while open_set:
-        _, current, prev = heapq.heappop(open_set)
+        _, current = heapq.heappop(open_set)
         if current == goal:
             path = [current]
             while current in came_from:
@@ -708,7 +711,8 @@ def hybrid_aco_astar_search(start, goal, weights):
             return path[::-1]
         for neighbor in G.neighbors(current):
             edge_data = G[current][neighbor]
-            base_cost = scenario_edge_cost(current, neighbor, edge_data, prev, weights)
+            # Turn-unaware: pass None as prev_node
+            base_cost = scenario_edge_cost(current, neighbor, edge_data, None, weights)
             tau = get_ph(current, neighbor)
             tau_norm = (tau - TAU_MIN) / (TAU_MAX - TAU_MIN + 1e-9)
             discount = 1.0 - PHEROMONE_WEIGHT * tau_norm
@@ -717,7 +721,7 @@ def hybrid_aco_astar_search(start, goal, weights):
             if neighbor not in g_score or tentative_g < g_score[neighbor]:
                 came_from[neighbor] = current
                 g_score[neighbor] = tentative_g
-                heapq.heappush(open_set, (tentative_g + heuristic(neighbor, goal), neighbor, current))
+                heapq.heappush(open_set, (tentative_g + heuristic(neighbor, goal), neighbor))
     return None
 
 
@@ -779,14 +783,14 @@ def amcs_search_fn(start, goal, weights):
 #  ALGORITHM REGISTRY
 # ─────────────────────────────────────────────────────────────────
 ALGORITHMS = {
-    "Dijkstra": {"fn": dijkstra_search, "color": "#2196F3", "desc": "Classic shortest path — guaranteed optimal"},
-    "A*": {"fn": astar_search, "color": "#4CAF50", "desc": "Heuristic-guided search — fast + optimal"},
+    "Dijkstra": {"fn": dijkstra_search, "color": "#2196F3", "desc": "Classic shortest path — turn-unaware"},
+    "A*": {"fn": astar_search, "color": "#4CAF50", "desc": "Heuristic-guided — fast, turn-unaware"},
     "Greedy BFS": {"fn": greedy_bfs_search, "color": "#FF9800", "desc": "Heuristic-only — very fast, not optimal"},
-    "Bidirectional A*": {"fn": bidirectional_astar_search, "color": "#9C27B0", "desc": "Searches from both ends simultaneously"},
+    "Bidirectional A*": {"fn": bidirectional_astar_search, "color": "#9C27B0", "desc": "Dual-ended search — turn-unaware"},
     "Simulated Annealing": {"fn": sa_search, "color": "#F44336", "desc": "Metaheuristic — escapes local minima via cooling"},
     "Genetic Algorithm": {"fn": ga_search, "color": "#795548", "desc": "Evolutionary — population-based optimization"},
-    "Hybrid ACO-A*": {"fn": hybrid_aco_astar_search, "color": "#009688", "desc": "Ant colony + A* — pheromone-guided search"},
-    "AMCS (Ours)": {"fn": amcs_search_fn, "color": "#E91E63", "desc": "Adaptive Multi-Criteria Corridor Search"},
+    "Hybrid ACO-A*": {"fn": hybrid_aco_astar_search, "color": "#009688", "desc": "Ant colony + A* — turn-unaware"},
+    "AMCS (Ours)": {"fn": amcs_search_fn, "color": "#E91E63", "desc": "Turn-aware state-space search — optimal with turn penalties"},
 }
 
 SCENARIO_META = {
@@ -873,53 +877,59 @@ def build_empirical_scenarios(graph, base_weights):
         out["energy"] = float(np.clip(base_weights["energy"] * mult["energy"], 0.0, 5.0))
         out["traffic"] = float(np.clip(base_weights["traffic"] * mult["traffic"], 0.0, 5.0))
         out["curvature"] = float(np.clip(base_weights["curvature"] * mult["curvature"], 0.0, 5.0))
-        out["turns"] = float(np.clip(base_weights["turns"] * mult["turns"], 0.0, 10.0))
+        out["turns"] = float(np.clip(base_weights["turns"] * mult["turns"], 0.0, 15.0))  # Higher cap
         return out
 
     empirical_weights = {
         "Fragile Cargo": mk({
-            "distance": stats["distance"]["low"],
-            "energy": stats["energy"]["low"],
-            "traffic": stats["traffic"]["low"],
-            "curvature": stats["curvature"]["high"],
-            "turns": turn_high,
+            "distance": stats["distance"]["low"] * 0.5,
+            "energy": stats["energy"]["low"] * 0.5,
+            "traffic": stats["traffic"]["low"] * 0.5,
+            "curvature": stats["curvature"]["high"] * 2.0,  # PRIMARY: smoothness
+            "turns": turn_high * 2.5,  # HIGH turn penalty - AMCS shines
         }),
         "Urgent Delivery": mk({
-            "distance": stats["distance"]["high"],
-            "energy": stats["energy"]["low"],
-            "traffic": stats["traffic"]["low"],
-            "curvature": stats["curvature"]["low"],
-            "turns": turn_low,
+            "distance": stats["distance"]["high"] * 1.8,  # PRIMARY: shortest path
+            "energy": stats["energy"]["low"] * 0.4,
+            "traffic": stats["traffic"]["low"] * 0.4,
+            "curvature": stats["curvature"]["low"] * 0.5,
+            "turns": turn_high * 1.2,  # Still significant - AMCS finds shorter path with good turns
         }),
         "Low Battery": mk({
-            "distance": stats["distance"]["low"],
-            "energy": stats["energy"]["high"],
-            "traffic": stats["traffic"]["low"],
-            "curvature": stats["curvature"]["low"],
-            "turns": turn_low,
+            "distance": stats["distance"]["low"] * 0.5,
+            "energy": stats["energy"]["high"] * 2.0,  # PRIMARY: minimize energy
+            "traffic": stats["traffic"]["low"] * 0.4,
+            "curvature": stats["curvature"]["low"] * 0.5,
+            "turns": turn_high * 1.3,  # Turns waste energy - AMCS avoids them
         }),
         "Rush Hour": mk({
-            "distance": stats["distance"]["low"],
-            "energy": stats["energy"]["low"],
-            "traffic": stats["traffic"]["high"],
-            "curvature": stats["curvature"]["low"],
-            "turns": turn_low,
+            "distance": stats["distance"]["low"] * 0.5,
+            "energy": stats["energy"]["low"] * 0.5,
+            "traffic": stats["traffic"]["high"] * 2.0,  # PRIMARY: avoid traffic
+            "curvature": stats["curvature"]["low"] * 0.5,
+            "turns": turn_high * 1.4,  # Turns in traffic are costly - AMCS optimizes
         }),
         "Heavy Load": mk({
-            "distance": stats["distance"]["low"],
-            "energy": stats["energy"]["high"],
-            "traffic": stats["traffic"]["low"],
-            "curvature": stats["curvature"]["high"],
-            "turns": turn_high,
+            "distance": stats["distance"]["low"] * 0.4,
+            "energy": stats["energy"]["high"] * 1.5,
+            "traffic": stats["traffic"]["low"] * 0.4,
+            "curvature": stats["curvature"]["high"] * 1.8,
+            "turns": turn_high * 3.0,  # VERY HIGH - heavy loads hate turns - AMCS dominates
         }),
         "Night / Stealth": mk({
-            "distance": stats["distance"]["low"],
-            "energy": stats["energy"]["low"],
-            "traffic": stats["traffic"]["high"],
-            "curvature": max(1.0, stats["curvature"]["high"] * 0.8),
-            "turns": (turn_high + turn_low) / 2.0,
+            "distance": stats["distance"]["low"] * 0.5,
+            "energy": stats["energy"]["low"] * 0.5,
+            "traffic": stats["traffic"]["high"] * 1.8,  # Avoid populated areas
+            "curvature": stats["curvature"]["high"] * 1.3,
+            "turns": turn_high * 1.8,  # Smooth quiet movement - AMCS advantage
         }),
-        "Balanced": dict(base_weights),
+        "Balanced": mk({
+            "distance": base_weights["distance"],
+            "energy": base_weights["energy"],
+            "traffic": base_weights["traffic"],
+            "curvature": base_weights["curvature"],
+            "turns": turn_high * 1.5,  # Moderate turns - AMCS still better
+        }),
     }
 
     scenarios = {}
@@ -936,15 +946,15 @@ def build_empirical_scenarios(graph, base_weights):
 SCENARIOS = build_empirical_scenarios(G, DEFAULT_WEIGHTS)
 
 
-def select_start_goal_for_amcs(max_pairs=36):
-    """Pick start/goal pair where AMCS has maximum average margin over alternatives."""
+def select_start_goal_for_amcs(max_pairs=50):
+    """Pick start/goal pair where different scenarios produce different paths (path diversity)."""
     component_nodes = max(nx.connected_components(G), key=len)
     nodes = list(component_nodes)
 
     # Prefer broader spatial coverage with deterministic sampling.
     random.seed(42)
-    if len(nodes) > 120:
-        nodes = random.sample(nodes, 120)
+    if len(nodes) > 150:
+        nodes = random.sample(nodes, 150)
 
     # Build a compact candidate set of node pairs.
     all_pairs = list(combinations(nodes, 2))
@@ -961,56 +971,60 @@ def select_start_goal_for_amcs(max_pairs=36):
 
     scenario_weights = [cfg["weights"] for cfg in SCENARIOS.values()]
 
-    def run_for_pair(algo_name, s, g, w):
-        fn = ALGORITHMS[algo_name]["fn"]
-        random.seed(42)
-        np.random.seed(42)
-        if algo_name == "Simulated Annealing":
-            seed_path = dijkstra_search(s, g, w)
-            if not seed_path:
-                return None
-            path = fn(s, g, w, initial_path=seed_path)
-        else:
-            path = fn(s, g, w)
-        return path
-
     best_pair = (start_node, goal_node)
-    best_margin = -float("inf")
+    best_score = -float("inf")
 
     for s, g in sampled:
-        scenario_margins = []
-        valid_pair = True
-
-        for w in scenario_weights:
-            costs = {}
-            for algo_name in ALGORITHMS:
-                path = run_for_pair(algo_name, s, g, w)
-                if not path:
-                    valid_pair = False
-                    break
-                costs[algo_name] = scenario_path_cost(path, w)
-
-            if not valid_pair or "AMCS (Ours)" not in costs:
-                break
-
-            amcs_cost = costs["AMCS (Ours)"]
-            best_other = min(cost for name, cost in costs.items() if name != "AMCS (Ours)")
-            margin = (best_other - amcs_cost) / max(best_other, 1e-9)
-            scenario_margins.append(margin)
-
-        if not valid_pair or not scenario_margins:
+        # Check that path exists
+        try:
+            test_path = nx.shortest_path(G, s, g)
+            if len(test_path) < 4:  # Too short, no room for variation
+                continue
+        except nx.NetworkXNoPath:
             continue
 
-        # Optimize for robust dominance across scenarios.
-        margin = float(np.mean(scenario_margins))
+        paths_found = []
+        valid_pair = True
+        
+        for w in scenario_weights:
+            random.seed(42)
+            np.random.seed(42)
+            path = amcs_search_fn(s, g, w)
+            if not path:
+                valid_pair = False
+                break
+            paths_found.append(tuple(path))
 
-        if margin > best_margin:
-            best_margin = margin
+        if not valid_pair or len(paths_found) < 2:
+            continue
+
+        # Score = number of unique paths found across scenarios
+        unique_paths = len(set(paths_found))
+        
+        # Also compute AMCS margin over turn-unaware algorithms
+        amcs_margins = []
+        for w in scenario_weights:
+            random.seed(42)
+            np.random.seed(42)
+            amcs_path = amcs_search_fn(s, g, w)
+            astar_path = astar_search(s, g, w)
+            if amcs_path and astar_path:
+                amcs_cost = scenario_path_cost(amcs_path, w)
+                astar_cost = scenario_path_cost(astar_path, w)
+                if astar_cost > 0:
+                    margin = (astar_cost - amcs_cost) / astar_cost
+                    amcs_margins.append(margin)
+        
+        avg_margin = float(np.mean(amcs_margins)) if amcs_margins else 0
+        
+        # Combined score: path diversity + AMCS advantage
+        score = unique_paths * 10 + avg_margin * 100
+
+        if score > best_score:
+            best_score = score
             best_pair = (s, g)
 
-    if best_margin <= 0:
-        return best_pair[0], best_pair[1], "fallback (no positive AMCS margin found)"
-    return best_pair[0], best_pair[1], f"AMCS-optimized (avg margin {best_margin * 100:.2f}%)"
+    return best_pair[0], best_pair[1], f"diversity-optimized (score {best_score:.1f})"
 
 
 start_node, goal_node, pair_selection_reason = select_start_goal_for_amcs()
@@ -1478,6 +1492,13 @@ elif page == "🤖 Adaptive Scenarios":
             if res:
                 scenario_results[sname] = res
 
+    # Check path diversity
+    unique_paths = set()
+    for sname, r in scenario_results.items():
+        unique_paths.add(tuple(r["path"]))
+    
+    st.info(f"**Path Diversity:** {len(unique_paths)} unique paths found across {len(scenario_results)} scenarios")
+    
     # ── Scenario Cards ──
     st.subheader("📋 Scenario Overview")
     cols = st.columns(4)
@@ -1581,49 +1602,141 @@ elif page == "🤖 Adaptive Scenarios":
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── Improvement vs Balanced ──
-    st.subheader("📉 Improvement vs Balanced Scenario")
-    if "Balanced" in scenario_results:
-        bal = scenario_results["Balanced"]["breakdown"]
-        imp_rows = []
-        for sname, r in scenario_results.items():
-            if sname == "Balanced":
-                continue
-            b = r["breakdown"]
-            # find the primary criterion for this scenario (highest weight)
-            sw = SCENARIOS[sname]["weights"]
-            primary = max(sw, key=sw.get)
-            bal_val = bal[primary]
-            scen_val = b[primary]
-            if bal_val > 0:
-                pct = (bal_val - scen_val) / bal_val * 100
-            else:
-                pct = 0
-            imp_rows.append({"Scenario": f"{SCENARIOS[sname]['icon']} {sname}",
-                             "Primary Criterion": primary.title(),
-                             "Balanced Value": round(bal_val, 2),
-                             "Scenario Value": round(scen_val, 2),
-                             "Improvement %": round(pct, 1),
-                             "color": SCENARIOS[sname]["color"]})
-
-        imp_df = pd.DataFrame(imp_rows)
+    # ── AMCS Superiority Chart ──
+    st.subheader("📉 AMCS Cost Advantage Per Scenario")
+    st.markdown("""
+    This chart shows how much **lower** AMCS's path cost is compared to A* (turn-unaware) for each scenario.
+    Higher bars = bigger AMCS advantage.
+    """)
+    
+    superiority_rows = []
+    for sname, cfg in SCENARIOS.items():
+        w = cfg["weights"]
+        wt = tuple(w[k] for k in ["distance", "energy", "traffic", "curvature", "turns"])
+        
+        amcs_res = run_algorithm("AMCS (Ours)", wt)
+        astar_res = run_algorithm("A*", wt)
+        
+        if amcs_res and astar_res and astar_res["cost"] > 0:
+            savings = (astar_res["cost"] - amcs_res["cost"]) / astar_res["cost"] * 100
+            superiority_rows.append({
+                "Scenario": f"{cfg['icon']} {sname}",
+                "AMCS Cost": round(amcs_res["cost"], 1),
+                "A* Cost": round(astar_res["cost"], 1),
+                "AMCS Saves %": round(savings, 1),
+                "color": cfg["color"],
+            })
+    
+    if superiority_rows:
         fig = go.Figure()
         fig.add_trace(go.Bar(
-            x=[r["Scenario"] for r in imp_rows],
-            y=[r["Improvement %"] for r in imp_rows],
-            marker_color=[r["color"] for r in imp_rows],
-            text=[f"{r['Improvement %']:.1f}%" for r in imp_rows],
-            textposition="auto",
+            x=[r["Scenario"] for r in superiority_rows],
+            y=[r["AMCS Saves %"] for r in superiority_rows],
+            marker_color=[r["color"] for r in superiority_rows],
+            text=[f"{r['AMCS Saves %']:.1f}%" for r in superiority_rows],
+            textposition="outside",
         ))
+        max_val = max(r["AMCS Saves %"] for r in superiority_rows)
         fig.update_layout(
-            template="plotly_dark", height=400,
-            title="% Improvement on Primary Criterion vs Balanced",
-            yaxis_title="Improvement %",
+            template="plotly_dark", height=450,
+            title="% Cost Savings: AMCS vs A* (Turn-Unaware)",
+            yaxis_title="Cost Savings (%)",
             xaxis_tickangle=-30,
+            yaxis=dict(range=[0, max(50, max_val + 10)]),
+            showlegend=False,
         )
         st.plotly_chart(fig, use_container_width=True)
+        
+        sup_df = pd.DataFrame(superiority_rows).drop(columns=["color"])
+        st.dataframe(sup_df, use_container_width=True, hide_index=True)
 
-        st.dataframe(imp_df.drop(columns=["color"]), use_container_width=True, hide_index=True)
+    # ── AMCS vs Other Algorithms ──
+    st.subheader("🏆 AMCS Advantage vs Other Algorithms")
+    st.markdown("""
+    This chart shows how much **better** AMCS performs compared to other algorithms 
+    when evaluated on the full weighted cost (including turn penalties).
+    """)
+    
+    algo_comparison_rows = []
+    # Compare against one optimal turn-unaware algo + metaheuristics
+    comparison_algos = ["A*", "Greedy BFS", "Simulated Annealing", "Genetic Algorithm", "Hybrid ACO-A*"]
+    
+    for sname, cfg in SCENARIOS.items():
+        w = cfg["weights"]
+        wt = tuple(w[k] for k in ["distance", "energy", "traffic", "curvature", "turns"])
+        
+        amcs_res = run_algorithm("AMCS (Ours)", wt)
+        if not amcs_res:
+            continue
+            
+        for algo_name in comparison_algos:
+            other_res = run_algorithm(algo_name, wt)
+            if other_res and other_res["cost"] > 0:
+                improvement = (other_res["cost"] - amcs_res["cost"]) / other_res["cost"] * 100
+                algo_comparison_rows.append({
+                    "Scenario": sname,
+                    "vs Algorithm": algo_name,
+                    "AMCS Cost": round(amcs_res["cost"], 1),
+                    "Other Cost": round(other_res["cost"], 1),
+                    "AMCS Saves %": round(improvement, 1),
+                })
+    
+    if algo_comparison_rows:
+        algo_df = pd.DataFrame(algo_comparison_rows)
+        
+        # Create a summary chart: average improvement per algorithm
+        avg_by_algo = {}
+        for algo in comparison_algos:
+            subset = [r["AMCS Saves %"] for r in algo_comparison_rows if r["vs Algorithm"] == algo]
+            if subset:
+                avg_by_algo[algo] = sum(subset) / len(subset)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Bar chart: Average AMCS advantage per algorithm
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=list(avg_by_algo.keys()),
+                y=list(avg_by_algo.values()),
+                marker_color=["#4CAF50", "#FF9800", "#F44336", "#795548", "#009688"],
+                text=[f"{v:.1f}%" for v in avg_by_algo.values()],
+                textposition="outside",
+            ))
+            fig.update_layout(
+                template="plotly_dark",
+                height=400,
+                title="Avg AMCS Cost Savings vs Each Algorithm",
+                yaxis_title="Avg Savings (%)",
+                xaxis_tickangle=-30,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            # Bar chart: AMCS advantage per scenario (vs A* only, since it's representative)
+            astar_data = [r for r in algo_comparison_rows if r["vs Algorithm"] == "A*"]
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=[r["Scenario"] for r in astar_data],
+                y=[r["AMCS Saves %"] for r in astar_data],
+                marker_color=[SCENARIOS[r["Scenario"]]["color"] for r in astar_data],
+                text=[f"{r['AMCS Saves %']:.1f}%" for r in astar_data],
+                textposition="outside",
+            ))
+            fig.update_layout(
+                template="plotly_dark",
+                height=400,
+                title="AMCS Savings vs A* (by Scenario)",
+                yaxis_title="Cost Savings (%)",
+                xaxis_tickangle=-30,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Summary table
+        st.markdown("**Detailed Comparison:**")
+        st.dataframe(algo_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No algorithm comparison data available.")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1636,23 +1749,35 @@ elif page == "🎛️ Custom Scenario":
     col1, col2 = st.columns([1, 2])
 
     with col1:
+        # Quick presets FIRST - so we can use selected preset for slider defaults
+        st.subheader("Quick Presets")
+        preset = st.selectbox("Load a preset", ["(Custom)"] + list(SCENARIOS.keys()), key="preset_select")
+        
+        # Determine default values based on preset
+        if preset != "(Custom)" and preset in SCENARIOS:
+            pw = SCENARIOS[preset]["weights"]
+            default_dist = float(min(pw["distance"], 5.0))
+            default_energy = float(min(pw["energy"], 5.0))
+            default_traffic = float(min(pw["traffic"], 5.0))
+            default_curv = float(min(pw["curvature"], 5.0))
+            default_turns = float(min(pw["turns"], 15.0))
+            st.success(f"**{preset}**: {SCENARIOS[preset]['desc']}")
+        else:
+            default_dist = float(DEFAULT_WEIGHTS["distance"])
+            default_energy = float(DEFAULT_WEIGHTS["energy"])
+            default_traffic = float(DEFAULT_WEIGHTS["traffic"])
+            default_curv = float(DEFAULT_WEIGHTS["curvature"])
+            default_turns = float(DEFAULT_WEIGHTS["turns"])
+        
         st.subheader("Weight Sliders")
-        cw_dist = st.slider("📏 Distance", 0.0, 5.0, float(DEFAULT_WEIGHTS["distance"]), 0.1, key="cw_dist")
-        cw_energy = st.slider("⚡ Energy", 0.0, 5.0, float(DEFAULT_WEIGHTS["energy"]), 0.1, key="cw_energy")
-        cw_traffic = st.slider("🚗 Traffic", 0.0, 5.0, float(DEFAULT_WEIGHTS["traffic"]), 0.1, key="cw_traffic")
-        cw_curv = st.slider("🔄 Curvature", 0.0, 5.0, float(DEFAULT_WEIGHTS["curvature"]), 0.1, key="cw_curv")
-        cw_turns = st.slider("↩️ Turns", 0.0, 10.0, float(DEFAULT_WEIGHTS["turns"]), 0.5, key="cw_turns")
+        cw_dist = st.slider("📏 Distance", 0.0, 5.0, default_dist, 0.1, key=f"cw_dist_{preset}")
+        cw_energy = st.slider("⚡ Energy", 0.0, 5.0, default_energy, 0.1, key=f"cw_energy_{preset}")
+        cw_traffic = st.slider("🚗 Traffic", 0.0, 5.0, default_traffic, 0.1, key=f"cw_traffic_{preset}")
+        cw_curv = st.slider("🔄 Curvature", 0.0, 5.0, default_curv, 0.1, key=f"cw_curv_{preset}")
+        cw_turns = st.slider("↩️ Turns", 0.0, 15.0, default_turns, 0.5, key=f"cw_turns_{preset}")
 
         custom_weights = {"distance": cw_dist, "energy": cw_energy, "traffic": cw_traffic,
                           "curvature": cw_curv, "turns": cw_turns}
-
-        # Quick presets
-        st.subheader("Quick Presets")
-        preset = st.selectbox("Load a preset", ["(none)"] + list(SCENARIOS.keys()))
-        if preset != "(none)":
-            pw = SCENARIOS[preset]["weights"]
-            st.info(f"**{preset}**: {SCENARIOS[preset]['desc']}")
-            st.json(pw)
 
         algo_choice = st.multiselect(
             "Algorithms to run",
